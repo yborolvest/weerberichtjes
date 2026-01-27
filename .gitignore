@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+ENV/
+env/
+
+# Media files (too large for GitHub)
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.flac
+*.aac
+*.m4a
+
+# Generated files
+*.wav
+weer_vandaag.mp4
+voice.wav
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Raw source files (already in .gitignore/raw/)
+.gitignore/
+
+# NetCDF files (downloaded temporarily)
+*.nc
+*.nc4
+
+# Environment variables
+.env
+.env.local
