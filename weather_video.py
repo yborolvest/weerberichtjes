@@ -310,6 +310,210 @@ def get_weather(city=CITY, country=COUNTRY):
                 os.unlink(tmp_path)
 
 
+def get_forecast(city=CITY):
+    """
+    Fetch today's forecast from KNMI Open Data API using the uwcw_extra_lv_ha43_nl_2km dataset.
+    Returns forecast temperature, condition, and max/min temperatures for today.
+    """
+    if not HAS_NETCDF:
+        print("Warning: netCDF4 not available, skipping forecast")
+        return None, None, None, None
+    
+    if not KNMI_API_KEY:
+        print("Warning: KNMI_API_KEY not set, skipping forecast")
+        return None, None, None, None
+    
+    base_url = "https://api.dataplatform.knmi.nl/open-data/v1"
+    dataset_name = "uwcw_extra_lv_ha43_nl_2km"
+    dataset_version = "1.0"
+    
+    # Get coordinates for De Bilt
+    target_lat = 52.10  # De Bilt latitude
+    target_lon = 5.18    # De Bilt longitude
+    
+    try:
+        # Step 1: List files to find air-temperature file
+        list_url = f"{base_url}/datasets/{dataset_name}/versions/{dataset_version}/files"
+        headers = {"Authorization": KNMI_API_KEY}
+        
+        params = {
+            "maxKeys": 100,
+            "sorting": "desc",
+            "orderBy": "lastModified"
+        }
+        
+        print(f"Fetching forecast files from KNMI...")
+        list_resp = requests.get(list_url, headers=headers, params=params)
+        list_resp.raise_for_status()
+        list_data = list_resp.json()
+        
+        if not list_data.get("files"):
+            print("Warning: No forecast files found")
+            return None, None, None, None
+        
+        # Find air-temperature file
+        temp_filename = None
+        for file_info in list_data.get("files", []):
+            filename = file_info.get("filename", "")
+            if "air-temperature-hagl" in filename:
+                temp_filename = filename
+                break
+        
+        if not temp_filename:
+            print("Warning: air-temperature forecast file not found")
+            return None, None, None, None
+        
+        print(f"Found temperature forecast file: {temp_filename}")
+        
+        # Step 2: Get download URL for temperature file
+        download_url_endpoint = f"{base_url}/datasets/{dataset_name}/versions/{dataset_version}/files/{temp_filename}/url"
+        download_resp = requests.get(download_url_endpoint, headers=headers)
+        download_resp.raise_for_status()
+        download_data = download_resp.json()
+        temp_download_url = download_data["temporaryDownloadUrl"]
+        
+        # Step 3: Download and parse temperature
+        print(f"Downloading and parsing temperature forecast...")
+        forecast_temp = None
+        lat_idx = None
+        lon_idx = None
+        
+        with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            try:
+                file_resp = requests.get(temp_download_url, stream=True)
+                file_resp.raise_for_status()
+                for chunk in file_resp.iter_content(chunk_size=8192):
+                    tmp_file.write(chunk)
+                tmp_file.flush()
+                
+                with netCDF4.Dataset(tmp_path, 'r') as nc:
+                    # Find lat/lon
+                    lat_var = nc.variables.get('latitude')
+                    lon_var = nc.variables.get('longitude')
+                    
+                    if lat_var is None or lon_var is None:
+                        print("Warning: Could not find lat/lon in forecast file")
+                        return None, None, None, None
+                    
+                    lat_data = np.array(lat_var[:])
+                    lon_data = np.array(lon_var[:])
+                    
+                    # Find nearest grid point
+                    lat_idx = int(np.argmin(np.abs(lat_data - target_lat)))
+                    lon_idx = int(np.argmin(np.abs(lon_data - target_lon)))
+                    
+                    # Get temperature variable (air-temperature-hagl)
+                    temp_var = nc.variables.get('air-temperature-hagl')
+                    if temp_var is None:
+                        print("Warning: air-temperature-hagl variable not found")
+                        return None, None, None, None
+                    
+                    temp_data = np.array(temp_var[:])
+                    # Shape is (time, height_level, lat, lon) = (60, 1, 390, 390)
+                    # Get first time step (today), first height level, at De Bilt location
+                    if temp_data.ndim == 4:
+                        forecast_temp = float(temp_data[0, 0, lat_idx, lon_idx])
+                    elif temp_data.ndim == 3:
+                        forecast_temp = float(temp_data[0, lat_idx, lon_idx])
+                    elif temp_data.ndim == 2:
+                        forecast_temp = float(temp_data[lat_idx, lon_idx])
+                    else:
+                        forecast_temp = float(temp_data[0])
+                    
+                    print(f"Forecast temperature: {forecast_temp:.1f}°C at grid point ({lat_data[lat_idx]:.2f}°N, {lon_data[lon_idx]:.2f}°E)")
+                    
+            finally:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        
+        # Step 4: Get precipitation data to derive weather condition
+        forecast_condition = None
+        # Find rainfall file
+        rainfall_filename = None
+        for file_info in list_data.get("files", []):
+            filename = file_info.get("filename", "")
+            if "rainfall-accumulation-01h-hagl" in filename:
+                rainfall_filename = filename
+                break
+        
+        if rainfall_filename and lat_idx is not None and lon_idx is not None:
+            try:
+                download_url_endpoint = f"{base_url}/datasets/{dataset_name}/versions/{dataset_version}/files/{rainfall_filename}/url"
+                download_resp = requests.get(download_url_endpoint, headers=headers)
+                download_resp.raise_for_status()
+                download_data = download_resp.json()
+                precip_download_url = download_data["temporaryDownloadUrl"]
+                
+                with tempfile.NamedTemporaryFile(suffix=".nc", delete=False) as tmp_file:
+                    tmp_path = tmp_file.name
+                    try:
+                        file_resp = requests.get(precip_download_url, stream=True)
+                        file_resp.raise_for_status()
+                        for chunk in file_resp.iter_content(chunk_size=8192):
+                            tmp_file.write(chunk)
+                        tmp_file.flush()
+                        
+                        with netCDF4.Dataset(tmp_path, 'r') as nc:
+                            precip_var = nc.variables.get('rainfall-accumulation-01h-hagl')
+                            if precip_var is not None:
+                                precip_data = np.array(precip_var[:])
+                                # Get first time step
+                                if precip_data.ndim == 4:
+                                    precip = float(precip_data[0, 0, lat_idx, lon_idx])
+                                elif precip_data.ndim == 3:
+                                    precip = float(precip_data[0, lat_idx, lon_idx])
+                                elif precip_data.ndim == 2:
+                                    precip = float(precip_data[lat_idx, lon_idx])
+                                else:
+                                    precip = float(precip_data[0])
+                                
+                                # Derive condition from precipitation
+                                if precip > 0.5:
+                                    forecast_condition = "regen"
+                                elif precip > 0.1:
+                                    forecast_condition = "lichte regen"
+                                else:
+                                    # Simple condition based on temperature
+                                    if forecast_temp <= 5:
+                                        forecast_condition = "bewolkt"
+                                    elif forecast_temp > 20:
+                                        forecast_condition = "gedeeltelijk bewolkt"
+                                    else:
+                                        forecast_condition = "bewolkt"
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.unlink(tmp_path)
+            except Exception as e:
+                print(f"Warning: Could not get precipitation data: {e}")
+        
+        # Fallback condition if precipitation data not available
+        if forecast_condition is None:
+            if forecast_temp <= 5:
+                forecast_condition = "bewolkt"
+            elif forecast_temp > 20:
+                forecast_condition = "gedeeltelijk bewolkt"
+            else:
+                forecast_condition = "bewolkt"
+        
+        # Calculate max/min from temperature forecast (use first few hours for min, later hours for max)
+        max_temp = None
+        min_temp = None
+        if forecast_temp is not None:
+            # For now, use forecast_temp as average, estimate max/min
+            max_temp = forecast_temp + 3  # Rough estimate
+            min_temp = forecast_temp - 3  # Rough estimate
+        
+        print(f"Forecast: {forecast_temp:.1f}°C, Condition: {forecast_condition}, Max: {max_temp}, Min: {min_temp}")
+        return forecast_temp, forecast_condition, max_temp, min_temp
+                    
+    except Exception as e:
+        print(f"Warning: Could not fetch forecast: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, None, None, None
+
+
 def map_ww_code_to_condition(ww_code):
     """
     Map WMO weather code (WW) to Dutch condition text.
@@ -504,13 +708,14 @@ def map_ww_code_to_condition(ww_code):
 
 # ---------- MOOD & MUSIC ----------
 
-def pick_mood_and_music(temp_c, condition_text):
+def pick_mood_and_music(temp_c, condition_text, forecast_temp=None, forecast_condition=None):
     """
     Map weather and temperature -> mood and a music filename.
     Uses your existing tracks: cold.mp3, hot.mp3, normal.mp3, rainy.mp3, warm.mp3.
-    Easy to extend with alternative tracks later.
+    Considers both current weather and forecast if available.
     """
     cond = condition_text.lower()
+    forecast_cond = (forecast_condition or "").lower() if forecast_condition else ""
 
     # Base tracks in your music folder
     mapping = {
@@ -528,18 +733,22 @@ def pick_mood_and_music(temp_c, condition_text):
             return None
         return random.choice(tracks)
 
+    # Use forecast if available, otherwise use current
+    use_temp = forecast_temp if forecast_temp is not None else temp_c
+    use_cond = forecast_cond if forecast_cond else cond
+
     # Rain-based mood (overrides pure temp)
-    if "regen" in cond or "bui" in cond or "motregen" in cond:
+    if "regen" in use_cond or "bui" in use_cond or "motregen" in use_cond:
         return "regenachtig", pick_track("rainy")
 
     # Temperature bands (tweak thresholds as you like)
-    if temp_c <= 5:
+    if use_temp <= 5:
         return "erg koud", pick_track("cold")
-    if 5 < temp_c <= 15:
+    if 5 < use_temp <= 15:
         return "aangenaam", pick_track("normal")
-    if 15 < temp_c <= 23:
+    if 15 < use_temp <= 23:
         return "lekker warm", pick_track("warm")
-    if temp_c > 23:
+    if use_temp > 23:
         return "heet", pick_track("hot")
 
     # Fallback
@@ -648,6 +857,13 @@ MOOD_PATTERNS = [
     "Ik heb het {mood}."
 ]
 
+PREDICTION_PATTERNS = [
+    "Voor vandaag wordt {temp} graden en {cond} voorspeld.",
+    "De voorspelling voor vandaag: {temp} graden en {cond}.",
+    "Vandaag wordt het naar verwachting {temp} graden met {cond}.",
+    "De verwachting is {temp} graden en {cond} vandaag.",
+]
+
 CLOSINGS = [
     "Een fijne dag gewenst! Houdoe.",
     "Geniet van het weer en tot snel!",
@@ -657,18 +873,41 @@ CLOSINGS = [
     "doei"
 ]
 
-def jacket_advice(temp_c, condition_text):
-    """Return a short Dutch recommendation about wearing a jacket."""
+def jacket_advice(temp_c, condition_text, forecast_temp=None, forecast_condition=None):
+    """Return a short Dutch recommendation about wearing a jacket.
+    Considers both current weather and forecast if available."""
     temp = float(temp_c)
     cond = (condition_text or "").lower()
+    
+    # Use forecast if available, otherwise use current
+    use_temp = forecast_temp if forecast_temp is not None else temp_c
+    use_cond = forecast_condition.lower() if forecast_condition else cond
+    
+    # Check if forecast shows worse conditions
+    forecast_worse = False
+    if forecast_temp is not None and forecast_condition:
+        forecast_cond_lower = forecast_condition.lower()
+        if ("regen" in forecast_cond_lower or "bui" in forecast_cond_lower) and "regen" not in cond and "bui" not in cond:
+            forecast_worse = True
+        if forecast_temp < temp - 3:  # Forecast is significantly colder
+            forecast_worse = True
 
-    if temp <= 5:
-        return "Zeker een dikke jas en misschien zelfs een sjaal aan."
-    if "regen" in cond or "bui" in cond or "motregen" in cond:
-        return "Neem zeker een jas en liefst ook een regenjas mee."
-    if 5 < temp <= 12:
-        return "Een jas is aan te raden, vooral in de ochtend en avond."
-    if 12 < temp <= 18:
+    if use_temp <= 5:
+        advice = "Zeker een dikke jas en misschien zelfs een sjaal aan."
+        if forecast_worse:
+            advice += " En houd rekening met de voorspelling: het kan nog kouder worden."
+        return advice
+    if "regen" in use_cond or "bui" in use_cond or "motregen" in use_cond:
+        advice = "Neem zeker een jas en liefst ook een regenjas mee."
+        if forecast_worse:
+            advice += " De voorspelling geeft aan dat het later nog natter kan worden."
+        return advice
+    if 5 < use_temp <= 12:
+        advice = "Een jas is aan te raden, vooral in de ochtend en avond."
+        if forecast_worse:
+            advice += " De voorspelling suggereert dat het later kouder wordt."
+        return advice
+    if 12 < use_temp <= 18:
         return "Een lichte jas of vest is meestal voldoende."
     return "Een jas is vandaag meestal niet nodig."
 
@@ -688,10 +927,11 @@ def bbq_advice(temp_c, condition_text):
         return "Prima barbecueweer als je rekening houdt met de wind."
     return "Het is behoorlijk warm, zorg bij een barbecue voor genoeg drinken en schaduw."
 
-def build_forecast_text(city, temp_c, condition_text, mood_text):
+def build_forecast_text(city, temp_c, condition_text, mood_text, forecast_temp=None, forecast_condition=None):
     """
     Build a varied Dutch forecast text from simple templates,
     starting with weekday + date.
+    Includes prediction if forecast data is available.
     """
     now = datetime.now()
     weekday = WEEKDAGEN_NL[now.weekday()]
@@ -707,10 +947,18 @@ def build_forecast_text(city, temp_c, condition_text, mood_text):
         random.choice(TEMP_PATTERNS).format(city=city, temp=temp),
         random.choice(COND_PATTERNS).format(cond=condition_text),
         random.choice(MOOD_PATTERNS).format(mood=mood_text),
-        jacket_advice(temp_c, condition_text),
+    ]
+    
+    # Add prediction if available
+    if forecast_temp is not None and forecast_condition:
+        forecast_temp_int = int(forecast_temp)
+        parts.append(random.choice(PREDICTION_PATTERNS).format(temp=forecast_temp_int, cond=forecast_condition))
+    
+    parts.extend([
+        jacket_advice(temp_c, condition_text, forecast_temp, forecast_condition),
         # include bbq_advice(temp_c, condition_text) here if you still want it spoken
         random.choice(CLOSINGS),
-    ]
+    ])
     return " ".join(p.strip() for p in parts if p.strip())
 
 # ---------- GIBBERISH VOICE & SYLLABLES ----------
@@ -973,9 +1221,12 @@ def create_slide(city, temp_c, condition_text, mood_text, out_file="slide.png"):
 
 # ---------- VIDEO ----------
 
-def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condition_text, mood_text, out_file="weer_vandaag.mp4"):
+def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condition_text, mood_text, 
+                 forecast_temp=None, forecast_condition=None, forecast_max=None, forecast_min=None, 
+                 out_file="weer_vandaag.mp4"):
     """
     Combine the slide image, gibberish voice and background music into one MP4.
+    Includes forecast overlay if forecast data is provided.
     """
     if not os.path.exists(music_file):
         raise FileNotFoundError(
@@ -1245,6 +1496,10 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
     # --- Temperature overlay: Icon + Temperature + City (centered column) ---
     temp_overlay = None
     temp_overlay_clips = None
+    # Initialize these for use in forecast overlay
+    temp_overlay_x = None
+    temp_overlay_y = None
+    temp_box_w = None
     try:
         # Icon size (larger)
         icon_size = 256
@@ -1355,6 +1610,11 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
         # Move up by 100 pixels
         overlay_x = (bg_clip.w - box_w) // 2
         overlay_y = (bg_clip.h - box_h) // 2 - 100
+        
+        # Store these for use in forecast overlay
+        temp_overlay_x = overlay_x
+        temp_overlay_y = overlay_y
+        temp_box_w = box_w
 
         # Default fade start (fallback)
         fade_start = 1.0
@@ -1445,6 +1705,172 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
         temp_overlay = None
         temp_overlay_clips = None
 
+    # --- Forecast overlay: Display to the right of current weather ---
+    forecast_overlay_clips = None
+    print(f"DEBUG: forecast_temp={forecast_temp}, forecast_condition={forecast_condition}")
+    if forecast_temp is not None and forecast_condition:
+        print(f"DEBUG: Creating forecast overlay...")
+        try:
+            # Use smaller icon for forecast
+            forecast_icon_size = 128
+            forecast_icon_spacing = 20
+            
+            # Load icon for forecast
+            forecast_icon_path = get_weather_icon_path(forecast_condition, forecast_temp)
+            forecast_icon_img = None
+            if forecast_icon_path and os.path.exists(forecast_icon_path):
+                forecast_icon_img = Image.open(forecast_icon_path).convert("RGBA")
+                forecast_icon_img = forecast_icon_img.resize((forecast_icon_size, forecast_icon_size), Image.Resampling.LANCZOS)
+            
+            # Forecast temperature text
+            forecast_temp_label = f"{int(forecast_temp)}°C"
+            try:
+                forecast_temp_font = ImageFont.truetype("Arial.ttf", 80)
+            except IOError:
+                forecast_temp_font = ImageFont.load_default()
+            
+            # Forecast label
+            forecast_label_text = "Voorspelling"
+            try:
+                forecast_label_font = ImageFont.truetype("Arial.ttf", 40)
+            except IOError:
+                forecast_label_font = ImageFont.load_default()
+            
+            # Calculate dimensions
+            forecast_temp_w = int(forecast_temp_font.getlength(forecast_temp_label))
+            forecast_temp_h = int(forecast_temp_font.size * 1.2)
+            forecast_label_w = int(forecast_label_font.getlength(forecast_label_text))
+            forecast_label_h = int(forecast_label_font.size * 1.2)
+            
+            # Total width is max of icon, temp, and label
+            forecast_total_w = max(forecast_icon_size, forecast_temp_w, forecast_label_w)
+            # Total height: label + spacing + icon + spacing + temp
+            forecast_total_h = forecast_label_h + forecast_icon_spacing + forecast_icon_size + forecast_icon_spacing + forecast_temp_h
+            
+            # Add padding for the background box
+            forecast_box_padding = 20
+            forecast_box_w = forecast_total_w + 2 * forecast_box_padding
+            forecast_box_h = forecast_total_h + 2 * forecast_box_padding
+            
+            # Create forecast background box with radial gradient
+            forecast_bg_box_img = Image.new("RGBA", (forecast_box_w, forecast_box_h), (0, 0, 0, 0))
+            
+            # Create radial gradient
+            forecast_center_x, forecast_center_y = forecast_box_w // 2, forecast_box_h // 2
+            forecast_max_dist = math.sqrt(forecast_center_x**2 + forecast_center_y**2)
+            
+            # Draw radial gradient
+            for y in range(forecast_box_h):
+                for x in range(forecast_box_w):
+                    dist = math.sqrt((x - forecast_center_x)**2 + (y - forecast_center_y)**2)
+                    normalized_dist = min(1.0, dist / forecast_max_dist)
+                    r = int(0 + normalized_dist * 20)
+                    g = int(50 + normalized_dist * 20)
+                    b = int(100 + normalized_dist * 20)
+                    alpha = 230
+                    forecast_bg_box_img.putpixel((x, y), (r, g, b, alpha))
+            
+            # Draw white border
+            forecast_bg_draw = ImageDraw.Draw(forecast_bg_box_img)
+            forecast_bg_draw.rectangle(
+                [(0, 0), (forecast_box_w - 1, forecast_box_h - 1)],
+                fill=None,
+                outline=(255, 255, 255, 255),
+                width=1
+            )
+            
+            # Create separate images for each element
+            forecast_content_x_offset = forecast_box_padding
+            forecast_content_y_offset = forecast_box_padding
+            
+            # Forecast label image
+            forecast_label_img = Image.new("RGBA", (forecast_box_w, forecast_box_h), (0, 0, 0, 0))
+            forecast_label_draw = ImageDraw.Draw(forecast_label_img)
+            forecast_label_x = forecast_content_x_offset + (forecast_total_w - forecast_label_w) // 2
+            forecast_label_y = forecast_content_y_offset
+            forecast_label_draw.text((forecast_label_x, forecast_label_y), forecast_label_text, 
+                                     font=forecast_label_font, fill=(255, 255, 255, 255))
+            
+            # Forecast icon image
+            forecast_icon_img_separate = None
+            if forecast_icon_img:
+                forecast_icon_img_separate = Image.new("RGBA", (forecast_box_w, forecast_box_h), (0, 0, 0, 0))
+                forecast_icon_x = forecast_content_x_offset + (forecast_total_w - forecast_icon_size) // 2
+                forecast_icon_y = forecast_content_y_offset + forecast_label_h + forecast_icon_spacing
+                forecast_icon_img_separate.paste(forecast_icon_img, (forecast_icon_x, forecast_icon_y), forecast_icon_img)
+            
+            # Forecast temperature image
+            forecast_temp_img = Image.new("RGBA", (forecast_box_w, forecast_box_h), (0, 0, 0, 0))
+            forecast_temp_draw = ImageDraw.Draw(forecast_temp_img)
+            forecast_temp_x = forecast_content_x_offset + (forecast_total_w - forecast_temp_w) // 2
+            forecast_temp_y = forecast_content_y_offset + forecast_label_h + forecast_icon_spacing + forecast_icon_size + forecast_icon_spacing
+            forecast_temp_draw.text((forecast_temp_x, forecast_temp_y), forecast_temp_label, 
+                                   font=forecast_temp_font, fill=(255, 255, 255, 255))
+            
+            # Position forecast box to the right of current weather box
+            # Current weather is centered, so forecast goes to the right
+            # Use temp_overlay_x/box_w if available, otherwise calculate from center
+            try:
+                forecast_overlay_x = temp_overlay_x + temp_box_w + 40  # 40px gap between boxes
+                forecast_overlay_y = temp_overlay_y  # Same vertical position
+            except NameError:
+                # Fallback: center both boxes side by side
+                total_boxes_width = forecast_box_w + 40 + temp_box_w if 'temp_box_w' in locals() else forecast_box_w
+                forecast_overlay_x = (bg_clip.w - total_boxes_width) // 2 + (temp_box_w if 'temp_box_w' in locals() else 0) + 40
+                forecast_overlay_y = (bg_clip.h - forecast_box_h) // 2 - 100
+            
+            # Create clips with fade-in
+            forecast_overlay_clips = []
+            fade_duration = 0.5
+            stagger_delay = 0.05
+            visible_duration = total_duration - fade_start
+            
+            # Background box
+            forecast_bg_arr = np.array(forecast_bg_box_img).astype(np.uint8)
+            forecast_bg_clip = ImageClip(forecast_bg_arr).with_duration(visible_duration)
+            try:
+                crossfade_effect = CrossFadeIn(duration=fade_duration)
+                forecast_bg_clip = crossfade_effect.apply(forecast_bg_clip)
+            except Exception as e:
+                print(f"Warning: Forecast background CrossFadeIn failed: {e}")
+            forecast_bg_clip = forecast_bg_clip.with_start(fade_start).with_position((forecast_overlay_x, forecast_overlay_y))
+            forecast_overlay_clips.append(forecast_bg_clip)
+            
+            # Label clip
+            forecast_label_arr = np.array(forecast_label_img).astype(np.uint8)
+            forecast_label_clip = ImageClip(forecast_label_arr).with_duration(visible_duration)
+            try:
+                forecast_label_clip = crossfade_effect.apply(forecast_label_clip)
+            except Exception as e:
+                print(f"Warning: Forecast label CrossFadeIn failed: {e}")
+            forecast_label_clip = forecast_label_clip.with_start(fade_start).with_position((forecast_overlay_x, forecast_overlay_y))
+            forecast_overlay_clips.append(forecast_label_clip)
+            
+            # Icon clip
+            if forecast_icon_img_separate:
+                forecast_icon_arr = np.array(forecast_icon_img_separate).astype(np.uint8)
+                forecast_icon_clip = ImageClip(forecast_icon_arr).with_duration(visible_duration)
+                try:
+                    forecast_icon_clip = crossfade_effect.apply(forecast_icon_clip)
+                except Exception as e:
+                    print(f"Warning: Forecast icon CrossFadeIn failed: {e}")
+                forecast_icon_clip = forecast_icon_clip.with_start(fade_start + stagger_delay).with_position((forecast_overlay_x, forecast_overlay_y))
+                forecast_overlay_clips.append(forecast_icon_clip)
+            
+            # Temperature clip
+            forecast_temp_arr = np.array(forecast_temp_img).astype(np.uint8)
+            forecast_temp_clip = ImageClip(forecast_temp_arr).with_duration(visible_duration)
+            try:
+                forecast_temp_clip = crossfade_effect.apply(forecast_temp_clip)
+            except Exception as e:
+                print(f"Warning: Forecast temp CrossFadeIn failed: {e}")
+            forecast_temp_clip = forecast_temp_clip.with_start(fade_start + 2 * stagger_delay).with_position((forecast_overlay_x, forecast_overlay_y))
+            forecast_overlay_clips.append(forecast_temp_clip)
+            
+        except Exception as e:
+            print(f"Warning: Could not create forecast overlay: {e}")
+            forecast_overlay_clips = None
+
     # --- Composite video ---
     video_layers = [bg_clip]
     if avatar_clip is not None:
@@ -1454,6 +1880,9 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
         video_layers.extend(temp_overlay_clips)
     elif temp_overlay is not None:
         video_layers.append(temp_overlay)
+    # Add forecast overlay clips
+    if forecast_overlay_clips:
+        video_layers.extend(forecast_overlay_clips)
     if subtitle_clips:
         video_layers.extend(subtitle_clips)
 
@@ -1470,11 +1899,15 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
 # ---------- MAIN ----------
 
 def main():
-    print("Fetching weather...")
+    print("Fetching current weather...")
     temp_c, condition_text = get_weather()
-    mood_text, music_file = pick_mood_and_music(temp_c, condition_text)
+    
+    print("Fetching forecast...")
+    forecast_temp, forecast_condition, forecast_max, forecast_min = get_forecast()
+    
+    mood_text, music_file = pick_mood_and_music(temp_c, condition_text, forecast_temp, forecast_condition)
 
-    forecast_text = build_forecast_text(CITY, temp_c, condition_text, mood_text)
+    forecast_text = build_forecast_text(CITY, temp_c, condition_text, mood_text, forecast_temp, forecast_condition)
     print("Forecast text:", forecast_text)
     print("Generating gibberish voice...")
     voice_file = create_gibberish_voice(forecast_text)
@@ -1483,7 +1916,8 @@ def main():
     slide_img = create_slide(CITY, temp_c, condition_text, mood_text)
 
     print("Rendering video...")
-    create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condition_text, mood_text)
+    create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condition_text, mood_text, 
+                 forecast_temp, forecast_condition, forecast_max, forecast_min)
 
     print("Done! Video saved as 'weer_vandaag.mp4'")
 
