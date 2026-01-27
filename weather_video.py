@@ -44,6 +44,15 @@ ICONS_DIR = os.path.join(BASE_DIR, "video_parts", "icons", "256w")  # Weather ic
 AVATAR_IMAGE = os.path.join(BASE_DIR, "avatar.png")  # optional, if present
 EXTRA_TAIL_SECONDS = 5.0  # extra background-only time after voice ends
 
+# Font configuration
+NORMAL_TEXT_FONT_SIZE = 40  # Font size for normal text (subtitles)
+TEMPERATURE_TEXT_FONT_SIZE = 140  # Font size for temperature text
+
+# Border width configuration
+SUBTITLE_BORDER_WIDTH = 3  # Border width for subtitle box
+TEMPERATURE_OVERLAY_BORDER_WIDTH = 2  # Border width for temperature overlay box
+FORECAST_OVERLAY_BORDER_WIDTH = 2  # Border width for forecast overlay box
+
 
 # ---------- WEATHER ----------
 
@@ -893,7 +902,7 @@ def jacket_advice(temp_c, condition_text, forecast_temp=None, forecast_condition
             forecast_worse = True
 
     if use_temp <= 5:
-        advice = "Zeker een dikke jas en misschien zelfs een sjaal aan."
+        advice = "Doe zeker een dikke jas aan en misschien zelfs een sjaal om."
         if forecast_worse:
             advice += " En houd rekening met de voorspelling: het kan nog kouder worden."
         return advice
@@ -909,7 +918,7 @@ def jacket_advice(temp_c, condition_text, forecast_temp=None, forecast_condition
         return advice
     if 12 < use_temp <= 18:
         return "Een lichte jas of vest is meestal voldoende."
-    return "Een jas is vandaag meestal niet nodig."
+    return "Een jas is vandaag echt niet nodig."
 
 
 def bbq_advice(temp_c, condition_text):
@@ -1237,8 +1246,11 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
     voice = AudioFileClip(voice_file)
     music_base = AudioFileClip(music_file)
 
-    # Total video duration: voice plus some extra background-only time
-    total_duration = voice.duration + EXTRA_TAIL_SECONDS
+    # Avatar entry animation duration (1 second)
+    avatar_entry_duration = 1.0
+
+    # Total video duration: entry animation + voice + extra background-only time
+    total_duration = avatar_entry_duration + voice.duration + EXTRA_TAIL_SECONDS
 
     # Fit background music to total_duration (loop or trim)
     if music_base.duration >= total_duration:
@@ -1248,8 +1260,12 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
         music_long = concatenate_audioclips([music_base] * loops)
         music = music_long.subclipped(0, total_duration)
 
+    # Music plays from the start, voice is delayed by avatar_entry_duration to sync with avatar entry animation
+    voice_delayed = voice.with_start(avatar_entry_duration)
+
     # Voice is shorter; CompositeAudioClip will just have voice where present
-    final_audio = CompositeAudioClip([music, voice])
+    # Music starts immediately, voice starts after entry animation
+    final_audio = CompositeAudioClip([music, voice_delayed])
 
     # --- Background visual: optional video, else static slide ---
     bg_clip = None
@@ -1325,19 +1341,45 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
             x = 40
             base_y = bg_clip.h - avatar.h - 40
             amp = 35  # maximum bounce height in pixels
-
-            if env is not None and voice.duration > 0:
-                # Map current time to envelope index (clamped)
-                if t >= voice.duration:
-                    idx = len(env) - 1
-                else:
-                    idx = int((t / voice.duration) * (len(env) - 1))
-                idx = max(0, min(len(env) - 1, idx))
-                level = float(env[idx])
-                y = base_y - amp * level
+            
+            # Entry animation: bounce up from below screen over 1 second
+            if t < avatar_entry_duration:
+                # Start position: below screen
+                start_y = bg_clip.h
+                # End position: base position
+                end_y = base_y
+                # Use an easing function for smooth bounce-up animation
+                progress = t / avatar_entry_duration
+                
+                # Smooth ease-out quintic (1 - (1-t)^5) for more natural deceleration
+                # This creates a smoother, more gradual slowdown
+                eased = 1 - (1 - progress) ** 5
+                
+                # Add a subtle bounce/overshoot at the end for a playful effect
+                # The bounce is smaller and happens later for a more refined feel
+                if progress > 0.8:
+                    # Subtle bounce: smaller amplitude, shorter duration
+                    bounce_progress = (progress - 0.8) / 0.2  # Normalize to 0-1 for last 20%
+                    bounce_factor = 0.05 * math.sin(bounce_progress * math.pi)
+                    eased += bounce_factor
+                
+                y = start_y + (end_y - start_y) * eased
             else:
-                # Fallback: gentle idle bounce if envelope not available
-                y = base_y - 10 * abs(math.sin(2 * math.pi * t / 0.8))
+                # After entry animation, use normal bouncing
+                # Adjust time for bouncing calculation (subtract entry duration)
+                bounce_t = t - avatar_entry_duration
+                if env is not None and voice.duration > 0:
+                    # Map current time to envelope index (clamped)
+                    if bounce_t >= voice.duration:
+                        idx = len(env) - 1
+                    else:
+                        idx = int((bounce_t / voice.duration) * (len(env) - 1))
+                    idx = max(0, min(len(env) - 1, idx))
+                    level = float(env[idx])
+                    y = base_y - amp * level
+                else:
+                    # Fallback: gentle idle bounce if envelope not available
+                    y = base_y - 10 * abs(math.sin(2 * math.pi * bounce_t / 0.8))
             return (x, y)
 
         avatar_clip = avatar.with_position(bounce_pos)
@@ -1348,11 +1390,11 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
     if forecast_text:
         try:
             # Determine subtitle box width
-            box_width = int(bg_clip.w * 0.55)
+            box_width = int(bg_clip.w * 0.75)
 
-            # Load a font (reuse slide font if possible)
+            # Load a font for normal text (subtitles)
             try:
-                font = ImageFont.truetype("Arial.ttf", 32)
+                font = ImageFont.truetype("Arial.ttf", NORMAL_TEXT_FONT_SIZE)
             except IOError:
                 font = ImageFont.load_default()
 
@@ -1410,11 +1452,34 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
                     )
 
             total_events = len(syllable_events)
+            # Find the first actual word (skip punctuation/whitespace)
+            first_word_index = None
+            first_word_start_t = None
+            for i, ev in enumerate(syllable_events):
+                idx = ev["token_index"]
+                if idx < len(tokens):
+                    token = tokens[idx]
+                    # Check if this is an actual word (contains letters)
+                    if any(ch.isalpha() for ch in token):
+                        first_word_index = i
+                        first_word_start_t = float(ev.get("start", 0.0))
+                        break
+            
+            # If no word found, use first event
+            if first_word_index is None and syllable_events:
+                first_word_index = 0
+                first_word_start_t = float(syllable_events[0].get("start", 0.0))
+            
             for i, ev in enumerate(syllable_events):
                 idx = ev["token_index"]
                 start_t = float(ev.get("start", 0.0))
+                
+                # Don't show subtitle box until the first word is spoken
+                if first_word_index is not None and i < first_word_index:
+                    # This is before the first word, skip creating subtitle for this event
+                    continue
 
-                # Text up to and including this syllable token
+                # Text up to and including this syllable token (accumulate from start)
                 partial_text = "".join(tokens[: idx + 1])
 
                 # Wrap partial text to fit the box width
@@ -1452,7 +1517,7 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
                         radius=18,
                         fill=(0, 0, 0, 180),
                         outline=(255, 255, 255, 220),
-                        width=3,
+                        width=SUBTITLE_BORDER_WIDTH,
                     )
                 except AttributeError:
                     # Fallback if rounded_rectangle is unavailable
@@ -1460,7 +1525,7 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
                         [(0, 0), (bubble_w - 1, bubble_h - 1)],
                         fill=(0, 0, 0, 180),
                         outline=(255, 255, 255, 220),
-                        width=3,
+                        width=SUBTITLE_BORDER_WIDTH,
                     )
 
                 # Draw text inside the bubble with padding
@@ -1470,7 +1535,7 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
                     y += line_height
 
                 # Vertically: above bottom with padding
-                y_pos = bg_clip.h - bubble_h - 60
+                y_pos = bg_clip.h - bubble_h - 50
 
                 # Duration:
                 # - For all but the last: keep subtitle on screen until the NEXT syllable starts,
@@ -1483,10 +1548,13 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
                     # Last subtitle stays until total_duration (voice + tail)
                     clip_duration = max(0.01, total_duration - start_t)
 
+                # Delay subtitle start time by avatar_entry_duration to sync with audio
+                subtitle_start_t = start_t + avatar_entry_duration
+                
                 sc = (
                     ImageClip(np.array(subtitle_img))
                     .with_duration(clip_duration)
-                    .with_start(start_t)
+                    .with_start(subtitle_start_t)
                     .with_position((x_pos, y_pos))
                 )
                 subtitle_clips.append(sc)
@@ -1517,7 +1585,7 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
         # Temperature text (larger)
         temp_label = f"{int(temp_c)}°C"
         try:
-            temp_font = ImageFont.truetype("Arial.ttf", 120)
+            temp_font = ImageFont.truetype("Arial.ttf", TEMPERATURE_TEXT_FONT_SIZE)
         except IOError:
             temp_font = ImageFont.load_default()
         
@@ -1575,7 +1643,7 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
             [(0, 0), (box_w - 1, box_h - 1)],
             fill=None,  # No fill (gradient already applied)
             outline=border_color,
-            width=1
+            width=TEMPERATURE_OVERLAY_BORDER_WIDTH
         )
         
         # Create separate images for each element, all with same dimensions (box_w x box_h)
@@ -1616,8 +1684,8 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
         temp_overlay_y = overlay_y
         temp_box_w = box_w
 
-        # Default fade start (fallback)
-        fade_start = 1.0
+        # Default fade start (fallback) - delay by avatar_entry_duration
+        fade_start = avatar_entry_duration + 1.0
         fade_duration = 0.5
 
         # Try to sync fade_start with the syllable where temperature is spoken
@@ -1637,7 +1705,8 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
                         continue
                     tok = str(tokens[idx])
                     if str(temp_int) in tok or "graden" in tok.lower():
-                        fade_start = float(ev.get("start", fade_start))
+                        # Add avatar_entry_duration to sync with delayed audio
+                        fade_start = avatar_entry_duration + float(ev.get("start", 1.0))
                         break
         except Exception:
             # If anything fails, just keep the default fade_start
@@ -1776,7 +1845,7 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
                 [(0, 0), (forecast_box_w - 1, forecast_box_h - 1)],
                 fill=None,
                 outline=(255, 255, 255, 255),
-                width=1
+                width=FORECAST_OVERLAY_BORDER_WIDTH
             )
             
             # Create separate images for each element
@@ -1888,17 +1957,110 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
 
     final_video = CompositeVideoClip(video_layers)
     final_video = final_video.with_audio(final_audio)
+    
+    # Cut last 8 frames to prevent weird stuff at the end (8 frames at 24fps = 0.333 seconds)
+    fps = 24
+    frames_to_cut = 8
+    cut_duration = frames_to_cut / fps
+    
+    # Get actual video duration and trim if needed
+    # Use total_duration as the source of truth since that's what we calculated
+    actual_duration = total_duration
+    if actual_duration and actual_duration > cut_duration:
+        new_end_time = actual_duration - cut_duration
+        # Ensure we don't go negative or create invalid range
+        if new_end_time > 0 and new_end_time < actual_duration:
+            try:
+                final_video = final_video.subclipped(0, new_end_time)
+            except ValueError as e:
+                # If subclipped fails, try using the actual duration from the clip
+                clip_duration = final_video.duration
+                if clip_duration and clip_duration > cut_duration:
+                    safe_end = clip_duration - cut_duration
+                    if safe_end > 0:
+                        final_video = final_video.subclipped(0, safe_end)
+                    else:
+                        print(f"Warning: Cannot trim video, duration too short. Skipping trim.")
+                else:
+                    print(f"Warning: Cannot trim video: {e}. Skipping trim.")
+        else:
+            print(f"Warning: Invalid trim parameters. Duration: {actual_duration:.2f}s, Cut: {cut_duration:.2f}s. Skipping trim.")
 
-    final_video.write_videofile(out_file, fps=24, codec="libx264", audio_codec="aac")
+    final_video.write_videofile(out_file, fps=fps, codec="libx264", audio_codec="aac")
 
     voice.close()
     music_base.close()
     final_video.close()
 
 
+# ---------- DISCORD POSTING ----------
+
+def post_to_discord(video_path, webhook_url=None):
+    """
+    Post the generated video to Discord using a webhook.
+    
+    Args:
+        video_path: Path to the video file to upload
+        webhook_url: Discord webhook URL (or set DISCORD_WEBHOOK_URL env var)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    webhook_url = webhook_url or os.environ.get("DISCORD_WEBHOOK_URL")
+    
+    if not webhook_url:
+        print("Warning: No Discord webhook URL provided. Set DISCORD_WEBHOOK_URL environment variable or pass webhook_url parameter.")
+        return False
+    
+    if not os.path.exists(video_path):
+        print(f"Error: Video file not found: {video_path}")
+        return False
+    
+    # Check file size (Discord webhook limit is 25MB)
+    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    if file_size_mb > 25:
+        print(f"Warning: Video file is {file_size_mb:.1f}MB, which exceeds Discord webhook limit of 25MB.")
+        print("Consider using a Discord bot instead, or compress the video.")
+        return False
+    
+    try:
+        print(f"Uploading video to Discord ({file_size_mb:.1f}MB)...")
+        
+        # Get current time for message
+        now = datetime.now()
+        time_str = now.strftime("%H:%M")
+        
+        # Prepare the message
+        message = f"🌤️ Weersverwachting - {now.strftime('%d %B %Y')} om {time_str}"
+        
+        # Upload file to Discord webhook
+        with open(video_path, 'rb') as video_file:
+            files = {
+                'file': (os.path.basename(video_path), video_file, 'video/mp4')
+            }
+            data = {
+                'content': message
+            }
+            
+            response = requests.post(webhook_url, files=files, data=data)
+            response.raise_for_status()
+        
+        print("✅ Video successfully posted to Discord!")
+        return True
+        
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error posting to Discord: {e}")
+        if hasattr(e.response, 'text'):
+            print(f"Response: {e.response.text}")
+        return False
+    except Exception as e:
+        print(f"❌ Unexpected error posting to Discord: {e}")
+        return False
+
+
 # ---------- MAIN ----------
 
-def main():
+def main(post_to_discord_enabled=True):
     print("Fetching current weather...")
     temp_c, condition_text = get_weather()
     
@@ -1916,10 +2078,18 @@ def main():
     slide_img = create_slide(CITY, temp_c, condition_text, mood_text)
 
     print("Rendering video...")
+    video_path = "weer_vandaag.mp4"
     create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condition_text, mood_text, 
-                 forecast_temp, forecast_condition, forecast_max, forecast_min)
+                 forecast_temp, forecast_condition, forecast_max, forecast_min, out_file=video_path)
 
     print("Done! Video saved as 'weer_vandaag.mp4'")
+    
+    # Post to Discord if enabled
+    if post_to_discord_enabled:
+        post_to_discord(video_path)
 
 if __name__ == "__main__":
-    main()
+    import sys
+    # Allow disabling Discord posting via command line argument
+    post_enabled = "--no-discord" not in sys.argv
+    main(post_to_discord_enabled=post_enabled)

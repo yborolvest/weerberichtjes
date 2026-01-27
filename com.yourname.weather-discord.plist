@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yourname.weather-discord</string>
+    
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/yvorolefes/Desktop/Weersverwachtingetjes/schedule_discord_posts.sh</string>
+    </array>
+    
+    <key>StartCalendarInterval</key>
+    <array>
+        <!-- Run at 8:00 AM every day -->
+        <dict>
+            <key>Hour</key>
+            <integer>8</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <!-- Run at 6:00 PM every day -->
+        <dict>
+            <key>Hour</key>
+            <integer>18</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+    
+    <key>StandardOutPath</key>
+    <string>/Users/yvorolefes/Desktop/Weersverwachtingetjes/schedule_output.log</string>
+    
+    <key>StandardErrorPath</key>
+    <string>/Users/yvorolefes/Desktop/Weersverwachtingetjes/schedule_error.log</string>
+    
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
