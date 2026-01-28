@@ -24,6 +24,14 @@ except ImportError:
     HAS_NETCDF = False
     print("Warning: netCDF4 not installed. Install with: pip install netCDF4")
 
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+    HAS_BOTO3 = True
+except ImportError:
+    HAS_BOTO3 = False
+    print("Warning: boto3 not installed. Install with: pip install boto3")
+
 # ---------- CONFIG ----------
 
 # KNMI Open Data API key (use anonymous key or get registered key from https://developer.dataplatform.knmi.nl/)
@@ -38,7 +46,7 @@ COUNTRY = "Netherlands"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOICE_CLIPS_DIR = os.path.join(BASE_DIR, "voice", "jeroen", "clips")
 MUSIC_DIR = os.path.join(BASE_DIR, "music")
-# Prefer video backgrounds from video_parts/backgrounds
+# Preferred video backgrounds directory (local cache for background clips)
 BACKGROUND_DIR = os.path.join(BASE_DIR, "video_parts", "backgrounds")
 ICONS_DIR = os.path.join(BASE_DIR, "video_parts", "icons", "256w")  # Weather icons (256w PNG files)
 AVATAR_IMAGE = os.path.join(BASE_DIR, "avatar.png")  # optional, if present
@@ -52,6 +60,51 @@ TEMPERATURE_TEXT_FONT_SIZE = 140  # Font size for temperature text
 SUBTITLE_BORDER_WIDTH = 3  # Border width for subtitle box
 TEMPERATURE_OVERLAY_BORDER_WIDTH = 2  # Border width for temperature overlay box
 FORECAST_OVERLAY_BORDER_WIDTH = 2  # Border width for forecast overlay box
+
+
+def ensure_background_video_cached(music_name: str) -> None:
+    """
+    Ensure the background video for the given music_name is present locally.
+    If not, try to download it from MinIO/S3 into BACKGROUND_DIR.
+    """
+    if not ENABLE_S3_BACKGROUNDS:
+        return
+    if not HAS_BOTO3:
+        print("Warning: boto3 not available, cannot download backgrounds from S3")
+        return
+    if not (S3_ENDPOINT and S3_BUCKET and S3_ACCESS_KEY and S3_SECRET_KEY):
+        # Missing credentials or endpoint; skip S3 download
+        return
+
+    os.makedirs(BACKGROUND_DIR, exist_ok=True)
+    local_path = os.path.join(BACKGROUND_DIR, f"{music_name}.mp4")
+    if os.path.exists(local_path):
+        return
+
+    key = f"backgrounds/{music_name}.mp4"
+    print(f"Attempting to download background from S3: s3://{S3_BUCKET}/{key}")
+    try:
+        session = boto3.session.Session()
+        s3_client = session.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            config=BotoConfig(signature_version="s3v4"),
+            use_ssl=S3_USE_SSL,
+        )
+        s3_client.download_file(S3_BUCKET, key, local_path)
+        print(f"Downloaded background video to: {local_path}")
+    except Exception as e:
+        print(f"Warning: Could not download background video {key} from S3: {e}")
+
+# S3 / MinIO configuration for background videos
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://minio-o0oo4ocowgoc8g84gos0w8kc.157.90.230.108.sslip.io")
+S3_BUCKET = os.environ.get("S3_BUCKET", "weerberichten")
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY")  # required for MinIO
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY")  # required for MinIO
+S3_USE_SSL = os.environ.get("S3_USE_SSL", "true").lower() == "true"
+ENABLE_S3_BACKGROUNDS = os.environ.get("ENABLE_S3_BACKGROUNDS", "true").lower() == "true"
 
 
 # ---------- WEATHER ----------
@@ -1277,6 +1330,10 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
     if os.path.isdir(BACKGROUND_DIR):
         # Try to match background video name to music filename, e.g. rainy.mp4 for rainy.mp3
         music_name = os.path.splitext(os.path.basename(music_file))[0]
+
+        # Ensure the background is cached locally (download from S3/MinIO if needed)
+        ensure_background_video_cached(music_name)
+
         candidate = os.path.join(BACKGROUND_DIR, f"{music_name}.mp4")
         print(f"DEBUG: Music file: {music_file}")
         print(f"DEBUG: Music name (for matching): {music_name}")
