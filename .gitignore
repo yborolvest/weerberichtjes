@@ -13,7 +13,6 @@ ENV/
 env/
 
 # Media files (too large for GitHub)
-*.mp4
 *.mov
 *.avi
 *.mkv
@@ -54,3 +53,7 @@ Thumbs.db
 # Environment variables
 .env
 .env.local
+
+# Raw files
+raw/
+video_parts/raw/

@@ -9,7 +9,7 @@ from datetime import datetime
 import requests
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from moviepy.video.VideoClip import ImageClip
+from moviepy.video.VideoClip import ImageClip, VideoClip
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 from moviepy.audio.io.AudioFileClip import AudioFileClip
@@ -1270,49 +1270,87 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
     # --- Background visual: optional video, else static slide ---
     bg_clip = None
     bg_candidate = None
+    
+    print(f"DEBUG: Looking for background video in: {BACKGROUND_DIR}")
+    print(f"DEBUG: BACKGROUND_DIR exists: {os.path.isdir(BACKGROUND_DIR)}")
+    
     if os.path.isdir(BACKGROUND_DIR):
         # Try to match background video name to music filename, e.g. rainy.mp4 for rainy.mp3
         music_name = os.path.splitext(os.path.basename(music_file))[0]
         candidate = os.path.join(BACKGROUND_DIR, f"{music_name}.mp4")
+        print(f"DEBUG: Music file: {music_file}")
+        print(f"DEBUG: Music name (for matching): {music_name}")
+        print(f"DEBUG: Checking for background video at: {candidate}")
+        print(f"DEBUG: Background video file exists: {os.path.exists(candidate)}")
+        
         if os.path.exists(candidate):
             bg_candidate = candidate
+            print(f"DEBUG: ✓ Background video file FOUND: {bg_candidate}")
+        else:
+            print(f"DEBUG: ✗ Background video file NOT FOUND at: {candidate}")
+            # List available files for debugging
+            if os.path.exists(BACKGROUND_DIR):
+                available_files = [f for f in os.listdir(BACKGROUND_DIR) if f.endswith(('.mp4', '.avi', '.mov'))]
+                print(f"DEBUG: Available video files in background directory: {available_files}")
+    else:
+        print(f"DEBUG: ✗ Background directory does not exist: {BACKGROUND_DIR}")
 
     if bg_candidate:
-        base_bg = VideoFileClip(bg_candidate)
-        base_duration = base_bg.duration if base_bg.duration and base_bg.duration > 0 else total_duration
-        base_get_frame = base_bg.get_frame  # capture original frame function
+        print(f"DEBUG: Using background video: {bg_candidate}")
+        # Create a source clip to get properties and frames
+        frame_source_clip = VideoFileClip(bg_candidate)
+        base_duration = frame_source_clip.duration if frame_source_clip.duration and frame_source_clip.duration > 0 else total_duration
+        h, w = frame_source_clip.h, frame_source_clip.w
+        fps = frame_source_clip.fps if frame_source_clip.fps else 24
+        
+        print(f"Background video: {bg_candidate}, duration={base_duration}, size=({w},{h}), fps={fps}")
 
-        # Create a clip with the correct total duration
-        if base_duration >= total_duration:
-            bg_clip = base_bg.subclipped(0, total_duration)
-        else:
-            bg_clip = base_bg.with_duration(total_duration)
-
-        # Combined looping + blur frame function, always calling back into base_bg.get_frame
-        def looped_blurred_frame(t, get_frame=base_get_frame, dur=base_duration):
+        # Create frame function that loops and blurs
+        # Use the source clip directly (it has no frame_function, so safe to call get_frame)
+        def looped_blurred_frame(t, source_clip=frame_source_clip, dur=base_duration, clip_h=h, clip_w=w):
             if dur <= 0:
-                frame = get_frame(0)
+                t_use = 0
             else:
-                t_wrapped = t % dur
-                frame = get_frame(t_wrapped)
-            img = Image.fromarray(frame)
-            img = img.filter(ImageFilter.GaussianBlur(radius=12))
-            return np.array(img)
+                t_use = t % dur
+            
+            try:
+                # Get frame from source clip (safe because it has no frame_function)
+                frame = source_clip.get_frame(t_use)
+                
+                if frame is None or frame.size == 0:
+                    print(f"Warning: Invalid frame at t={t}, t_use={t_use}")
+                    return np.zeros((clip_h, clip_w, 3), dtype=np.uint8)
+                
+                # Apply blur
+                img = Image.fromarray(frame)
+                img = img.filter(ImageFilter.GaussianBlur(radius=12))
+                return np.array(img).astype(np.uint8)
+            except Exception as e:
+                print(f"Error in frame function at t={t}: {e}")
+                return np.zeros((clip_h, clip_w, 3), dtype=np.uint8)
 
+        # Create a NEW VideoClip from scratch with our frame function
+        # VideoClip constructor doesn't take make_frame, we need to create it and then assign frame_function
+        bg_clip = VideoClip(duration=total_duration)
+        bg_clip = bg_clip.with_fps(fps)
+        bg_clip.size = (w, h)  # Set size directly (w and h are read-only properties computed from size)
         bg_clip.frame_function = looped_blurred_frame
+        
+        # Keep frame_source_clip alive
+        bg_clip._frame_source = frame_source_clip
     else:
         # Fallback: static slide stretched to total_duration (also blurred)
-        base_clip = ImageClip(slide_img).with_duration(total_duration)
-        base_get_frame = base_clip.get_frame
-
-        def blurred_static_frame(t, get_frame=base_get_frame):
-            frame = get_frame(t)
-            img = Image.fromarray(frame)
-            img = img.filter(ImageFilter.GaussianBlur(radius=12))
-            return np.array(img)
-
-        base_clip.frame_function = blurred_static_frame
-        bg_clip = base_clip
+        print(f"DEBUG: No background video found, using static slide: {slide_img}")
+        print(f"DEBUG: Slide image exists: {os.path.exists(slide_img)}")
+        
+        # Load and blur the image directly to avoid recursion
+        original_img = Image.open(slide_img).convert("RGB")
+        blurred_img = original_img.filter(ImageFilter.GaussianBlur(radius=12))
+        blurred_array = np.array(blurred_img).astype(np.uint8)
+        
+        # Create clip from pre-blurred image (no frame_function needed)
+        bg_clip = ImageClip(blurred_array).with_duration(total_duration)
+        print(f"DEBUG: Created static background clip, size={blurred_array.shape}")
 
     # --- Precompute audio envelope for bounce (based on voice loudness) ---
     # Use RMS per audio frame, normalized to [0,1]
