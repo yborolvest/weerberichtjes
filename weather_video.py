@@ -1336,20 +1336,27 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
     if os.path.exists(AVATAR_IMAGE):
         # Force avatar to a fixed 256x256 size for a consistent look
         avatar = ImageClip(AVATAR_IMAGE).resized((256, 256)).with_duration(total_duration)
+        
+        # Capture values for closure to avoid binding issues
+        bg_height = bg_clip.h
+        avatar_height = avatar.h
+        entry_duration = avatar_entry_duration
+        audio_env = env
+        voice_duration = voice.duration if hasattr(voice, 'duration') else 0
 
         def bounce_pos(t):
             x = 40
-            base_y = bg_clip.h - avatar.h - 40
+            base_y = bg_height - avatar_height - 40
             amp = 35  # maximum bounce height in pixels
             
             # Entry animation: bounce up from below screen over 1 second
-            if t < avatar_entry_duration:
+            if t < entry_duration:
                 # Start position: below screen
-                start_y = bg_clip.h
+                start_y = bg_height
                 # End position: base position
                 end_y = base_y
                 # Use an easing function for smooth bounce-up animation
-                progress = t / avatar_entry_duration
+                progress = t / entry_duration
                 
                 # Smooth ease-out quintic (1 - (1-t)^5) for more natural deceleration
                 # This creates a smoother, more gradual slowdown
@@ -1367,15 +1374,15 @@ def create_video(slide_img, voice_file, music_file, forecast_text, temp_c, condi
             else:
                 # After entry animation, use normal bouncing
                 # Adjust time for bouncing calculation (subtract entry duration)
-                bounce_t = t - avatar_entry_duration
-                if env is not None and voice.duration > 0:
+                bounce_t = t - entry_duration
+                if audio_env is not None and voice_duration > 0:
                     # Map current time to envelope index (clamped)
-                    if bounce_t >= voice.duration:
-                        idx = len(env) - 1
+                    if bounce_t >= voice_duration:
+                        idx = len(audio_env) - 1
                     else:
-                        idx = int((bounce_t / voice.duration) * (len(env) - 1))
-                    idx = max(0, min(len(env) - 1, idx))
-                    level = float(env[idx])
+                        idx = int((bounce_t / voice_duration) * (len(audio_env) - 1))
+                    idx = max(0, min(len(audio_env) - 1, idx))
+                    level = float(audio_env[idx])
                     y = base_y - amp * level
                 else:
                     # Fallback: gentle idle bounce if envelope not available
