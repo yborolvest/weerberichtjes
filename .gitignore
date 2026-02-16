@@ -16,6 +16,7 @@ env/
 *.mov
 *.avi
 *.mkv
+*.mp4
 *.mp3
 *.wav
 *.flac
@@ -25,6 +26,9 @@ env/
 # Generated files
 *.wav
 weer_vandaag.mp4
+ramadan_vandaag.mp4
+ramadan_voice.wav
+ramadan_voice_timing.json
 voice.wav
 
 # IDE
