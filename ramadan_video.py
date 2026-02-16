@@ -9,6 +9,7 @@ import math
 import json
 import tempfile
 import glob
+import wave
 from datetime import datetime, date
 from typing import Optional
 
@@ -21,20 +22,178 @@ from moviepy.audio.io.AudioFileClip import AudioFileClip
 from moviepy.audio.AudioClip import CompositeAudioClip
 from moviepy.video.fx import CrossFadeIn
 
-# Import shared config and helpers from weather_video
-from weather_video import (
-    BASE_DIR,
-    FONT_DIR,
-    BACKGROUND_DIR,
-    AVATAR_IMAGE,
-    MUSIC_DIR,
-    EXTRA_TAIL_SECONDS,
-    NORMAL_TEXT_FONT_SIZE,
-    create_gibberish_voice,
-    split_into_syllable_tokens,
-    SUBTITLE_BORDER_WIDTH,
-    post_to_discord,
-)
+# ---------- PATHS & CONFIG ----------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FONT_DIR = os.path.join(BASE_DIR, "fonts")
+BACKGROUND_DIR = os.path.join(BASE_DIR, "video_parts", "backgrounds")
+AVATAR_IMAGE = os.path.join(BASE_DIR, "avatar.png")
+MUSIC_DIR = os.path.join(BASE_DIR, "music")
+EXTRA_TAIL_SECONDS = 5.0
+NORMAL_TEXT_FONT_SIZE = 40
+SUBTITLE_BORDER_WIDTH = 3
+
+# ---------- VOICE & SYLLABLES (for gibberish intro) ----------
+
+VOWELS = set("aeiouáéíóúäëïöüAEIOU")
+
+
+def _split_word_into_syllables(word: str):
+    """Split a word into chunks that each contain at least one vowel (for timing)."""
+    syllables = []
+    start = 0
+    i = 0
+    n = len(word)
+    while i < n:
+        has_vowel = False
+        while i < n:
+            if word[i] in VOWELS:
+                has_vowel = True
+            i += 1
+            if has_vowel:
+                break
+        while i < n and word[i] not in VOWELS:
+            if all(ch not in VOWELS for ch in word[i:]):
+                i = n
+                break
+            i += 1
+        syllables.append(word[start:i])
+        start = i
+    if start < n:
+        syllables.append(word[start:n])
+    return syllables
+
+
+def split_into_syllable_tokens(text: str):
+    """Split text into syllable-like tokens, preserving spaces and punctuation. Joining tokens reproduces the original."""
+    tokens = []
+    current_word = ""
+    for ch in text:
+        if ch.isspace():
+            if current_word:
+                tokens.extend(_split_word_into_syllables(current_word))
+                current_word = ""
+            tokens.append(ch)
+        elif ch.isalpha():
+            current_word += ch
+        else:
+            if current_word:
+                sylls = _split_word_into_syllables(current_word)
+                if sylls:
+                    sylls[-1] = sylls[-1] + ch
+                    tokens.extend(sylls)
+                else:
+                    tokens.append(ch)
+                current_word = ""
+            else:
+                if tokens and not tokens[-1].isspace():
+                    tokens[-1] = tokens[-1] + ch
+                else:
+                    tokens.append(ch)
+    if current_word:
+        tokens.extend(_split_word_into_syllables(current_word))
+    return tokens
+
+
+def create_gibberish_voice(text: str, voices_dir: str, out_file: str):
+    """Build gibberish voice WAV from syllable clips and save timing JSON for subtitles."""
+    if not os.path.isdir(voices_dir):
+        raise FileNotFoundError(f"Voice clips directory not found: {voices_dir}")
+    files = [os.path.join(voices_dir, f) for f in os.listdir(voices_dir) if f.lower().endswith(".wav")]
+    if not files:
+        raise FileNotFoundError(f"No .wav clips in '{voices_dir}'")
+    tokens = split_into_syllable_tokens(text)
+    combined_frames = bytearray()
+    chosen_params = None
+    current_time = 0.0
+    syllable_events = []
+
+    def append_silence(seconds: float):
+        nonlocal combined_frames, chosen_params
+        if chosen_params is None or seconds <= 0:
+            return
+        nframes = int(chosen_params.framerate * seconds)
+        silence = b"\x00" * nframes * chosen_params.nchannels * chosen_params.sampwidth
+        combined_frames.extend(silence)
+
+    for idx, tok in enumerate(tokens):
+        if tok.isspace():
+            append_silence(0.05)
+            current_time += 0.05
+            continue
+        path = random.choice(files)
+        with wave.open(path, "rb") as wf:
+            params = wf.getparams()
+            raw_frames = wf.readframes(params.nframes)
+        sampwidth = params.sampwidth
+        n_channels = params.nchannels
+        framerate = params.framerate or 44100
+        dtype = np.int8 if sampwidth == 1 else (np.int16 if sampwidth == 2 else (np.int32 if sampwidth == 4 else None))
+        if dtype is not None:
+            audio = np.frombuffer(raw_frames, dtype=dtype)
+            audio = audio.reshape((-1, n_channels)) if n_channels > 1 else audio.reshape((-1, 1))
+            pitch_factor = random.uniform(0.9, 1.1)
+            orig_len, new_len = audio.shape[0], max(1, int(audio.shape[0] / pitch_factor))
+            new_idx = np.linspace(0, orig_len - 1, new_len)
+            resampled = np.empty((new_len, audio.shape[1]), dtype=np.float32)
+            for ch in range(audio.shape[1]):
+                resampled[:, ch] = np.interp(new_idx, np.arange(orig_len), audio[:, ch].astype(np.float32))
+            resampled_int = np.clip(resampled, np.iinfo(dtype).min, np.iinfo(dtype).max).astype(dtype)
+            frames = resampled_int.tobytes()
+            dur = new_len / float(framerate)
+        else:
+            frames, dur = raw_frames, params.nframes / float(framerate)
+        if chosen_params is None:
+            chosen_params = params
+        else:
+            if params.nchannels != chosen_params.nchannels or params.sampwidth != chosen_params.sampwidth or framerate != chosen_params.framerate:
+                raise ValueError("All voice clips must have same channels, sample width and framerate.")
+        combined_frames.extend(frames)
+        start_time = current_time
+        end_time = current_time + dur
+        syllable_events.append({"token_index": idx, "start": start_time, "end": end_time})
+        current_time = end_time
+        if tok.strip().endswith((".", "!", "?")):
+            append_silence(0.6)
+            current_time += 0.6
+    if chosen_params is None:
+        raise RuntimeError("No voice clips were used.")
+    with wave.open(out_file, "wb") as out_wf:
+        out_wf.setparams(chosen_params)
+        out_wf.writeframes(combined_frames)
+    timing_path = os.path.splitext(out_file)[0] + "_timing.json"
+    try:
+        with open(timing_path, "w", encoding="utf-8") as f:
+            json.dump({"tokens": tokens, "syllables": syllable_events}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    return out_file
+
+
+def post_to_discord(video_path: str, webhook_url: Optional[str] = None, content: Optional[str] = None) -> bool:
+    """Post the video to Discord via webhook. Returns True on success."""
+    webhook_url = webhook_url or os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        print("Warning: No Discord webhook URL. Set DISCORD_WEBHOOK_URL or pass webhook_url.")
+        return False
+    if not os.path.exists(video_path):
+        print(f"Error: Video file not found: {video_path}")
+        return False
+    size_mb = os.path.getsize(video_path) / (1024 * 1024)
+    if size_mb > 25:
+        print(f"Warning: Video is {size_mb:.1f}MB; Discord webhook limit is 25MB.")
+        return False
+    try:
+        message = content if content is not None else f"🌙 Ramadan - {datetime.now().strftime('%d %B %Y')}"
+        with open(video_path, "rb") as f:
+            resp = requests.post(webhook_url, files={"file": (os.path.basename(video_path), f, "video/mp4")}, data={"content": message})
+        resp.raise_for_status()
+        print("✅ Video posted to Discord!")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error posting to Discord: {e}")
+        return False
+
 
 # ---------- RAMADAN CONFIG ----------
 
@@ -263,7 +422,7 @@ def create_ramadan_video(
 
         avatar_clip = avatar.with_position(bounce_pos)
 
-    # --- Subtitles for Dutch intro (same logic as weather_video) ---
+    # --- Subtitles for Dutch intro ---
     intro_text = None
     try:
         with open(os.path.splitext(voice_file)[0] + "_timing.json", "r", encoding="utf-8") as f:
