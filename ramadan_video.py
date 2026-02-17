@@ -197,7 +197,7 @@ def post_to_discord(video_path: str, webhook_url: Optional[str] = None, content:
 
 # ---------- RAMADAN CONFIG ----------
 
-RAMADAN_START_DATE = date(2025, 2, 17)
+RAMADAN_START_DATE = date(2026, 2, 17)
 QURAN_API_BASE = "https://quranapi.pages.dev/api"
 VOICE_CLIPS_DIR = os.path.join(BASE_DIR, "voice", "jeroen", "clips")
 SLIDE_IMAGE = os.path.join(BASE_DIR, "slide.png")
@@ -277,13 +277,18 @@ def pick_background_path() -> Optional[str]:
     return random.choice(candidates)
 
 
-def get_ramadan_music_path():
-    """Return path to a random background music file (01.mp3–08.mp3 in music/)."""
-    candidates = [
+def _ramadan_music_candidates():
+    """Return list of paths to existing music files (01.mp3–08.mp3 in music/)."""
+    return [
         os.path.join(MUSIC_DIR, name)
         for name in RAMADAN_MUSIC_NAMES
         if os.path.isfile(os.path.join(MUSIC_DIR, name))
     ]
+
+
+def get_ramadan_music_path():
+    """Return path to a random background music file (01.mp3–08.mp3 in music/)."""
+    candidates = _ramadan_music_candidates()
     if not candidates:
         raise FileNotFoundError(
             f"No Ramadan music found. Add 01.mp3–08.mp3 in {MUSIC_DIR}"
@@ -336,7 +341,25 @@ def create_ramadan_video(
     If verse_audio_file is set, the verse is also read aloud (Quran recitation) after the intro.
     """
     voice = AudioFileClip(voice_file)
-    music_base = AudioFileClip(music_file)
+    candidates = _ramadan_music_candidates()
+    if not candidates:
+        raise FileNotFoundError(f"No Ramadan music found. Add 01.mp3–08.mp3 in {MUSIC_DIR}")
+    tried = []
+    music_base = None
+    for path in [music_file] + [p for p in candidates if p != music_file]:
+        try:
+            music_base = AudioFileClip(path)
+            break
+        except Exception as e:
+            tried.append(path)
+            last_error = e
+            if len(tried) >= len(candidates):
+                raise RuntimeError(
+                    f"All music files failed to load (corrupt or invalid). Tried: {tried}"
+                ) from last_error
+            continue
+    if music_base is None:
+        raise RuntimeError("Could not load any music file.")
 
     avatar_entry_duration = 1.0
     verse_audio = None
